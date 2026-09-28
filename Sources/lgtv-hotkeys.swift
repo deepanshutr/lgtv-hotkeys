@@ -1,24 +1,4 @@
-// lgtv-hotkeys — system-wide hotkeys for an LG webOS TV over the ssap websocket protocol:
-// Ctrl+Shift+Left/Right cycle its CONNECTED HDMI inputs, Ctrl+Shift+Up wakes it (Wake-on-LAN).
-//
-// Zero dependencies. Hotkeys use Carbon RegisterEventHotKey, which needs NO Accessibility
-// permission (unlike CGEventTap-based tools). TV control is wss://<tv>:3001 with the TV's
-// self-signed cert accepted, falling back to ws://<tv>:3000 for old firmware.
-//
-// First use pairs with the TV: the TV shows an Allow prompt (accept once with the LG
-// remote); the client key is stored in ~/.config/lgtv-hotkeys/config.json. The daemon
-// auto-pairs on first hotkey press if no key is stored yet.
-//
-// The registration payload below is the canonical signed manifest every webOS client
-// library sends, embedded verbatim from lgtv2's pairing.json (hobbyquaker/lgtv2).
-//
-// Some routers reshuffle DHCP leases and block SSDP multicast, so TV discovery is a
-// unicast TCP sweep of the /24 for the ssap ports; on connect failure the daemon re-sweeps
-// and re-pins the TV's IP. Wake-on-LAN uses the configured MAC (broadcast, IP-independent).
-// NB: keep the Mac on the SAME Wi-Fi band as the TV — some routers AP-isolate 2.4GHz from
-// 5GHz, so a cross-band Mac cannot reach the TV.
-//
-// Commands: daemon | next | prev | wake | list | pair | discover | status | selftest
+// Cycle connected HDMI inputs with Carbon hotkeys, without Accessibility permission.
 
 import Foundation
 import AppKit
@@ -38,8 +18,6 @@ func logLine(_ msg: String) {
 struct Config {
     var ip: String?
     var clientKey: String?
-    var mac: String?          // TV MAC, for Wake-on-LAN (any separators/case)
-    var audioSyncPath: String? // optional absolute path to the lgtv-audio-sync binary
 
     static var dir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/lgtv-hotkeys")
@@ -49,19 +27,17 @@ struct Config {
     static func load() -> Config {
         guard let data = try? Data(contentsOf: file),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return Config(ip: nil, clientKey: nil, mac: nil, audioSyncPath: nil)
+            return Config()
         }
-        return Config(ip: obj["ip"] as? String, clientKey: obj["clientKey"] as? String,
-                      mac: obj["mac"] as? String, audioSyncPath: obj["audioSyncPath"] as? String)
+        let ip = obj["ip"] as? String
+        return Config(ip: ip == "" ? nil : ip, clientKey: obj["clientKey"] as? String)
     }
 
     func save() {
+        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
         var obj: [String: Any] = [:]
         if let ip = ip { obj["ip"] = ip }
         if let k = clientKey { obj["clientKey"] = k }
-        if let m = mac { obj["mac"] = m }
-        if let p = audioSyncPath { obj["audioSyncPath"] = p }
-        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
         if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .prettyPrinted]) {
             try? data.write(to: Config.file)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Config.file.path)
@@ -179,7 +155,6 @@ let pairingJSON = #"""
 struct TVInput {
     let id: String
     let connected: Bool
-    let appId: String
 }
 
 // "com.webos.app.hdmi3" -> "HDMI_3"; non-HDMI app ids -> nil
@@ -191,25 +166,13 @@ func hdmiFromAppId(_ appId: String) -> String? {
     return "HDMI_\(suffix)"
 }
 
-// Inverse of hdmiFromAppId: "HDMI_3" -> "com.webos.app.hdmi3"; non-HDMI ids -> nil. Used to tell
-// lgtv-audio-sync which input we just switched to, so it reconciles the bar audio for THAT input
-// immediately instead of waiting for its poll to notice.
-func appIdFromHDMI(_ id: String) -> String? {
-    let prefix = "HDMI_"
-    guard id.hasPrefix(prefix) else { return nil }
-    let n = id.dropFirst(prefix.count)
-    guard !n.isEmpty, n.allSatisfy({ $0.isNumber }) else { return nil }
-    return "com.webos.app.hdmi\(n)"
-}
-
 // Parse a ssap://tv/getExternalInputList response payload into TVInput records.
 func parseInputs(_ payload: [String: Any]) -> [TVInput] {
     guard let devices = payload["devices"] as? [[String: Any]] else { return [] }
     return devices.compactMap { d in
         guard let id = d["id"] as? String else { return nil }
         return TVInput(id: id,
-                       connected: d["connected"] as? Bool ?? false,
-                       appId: d["appId"] as? String ?? "")
+                       connected: d["connected"] as? Bool ?? false)
     }
 }
 
@@ -262,22 +225,17 @@ func runSelftest() -> Int32 {
 
     check("appid hdmi1", hdmiFromAppId("com.webos.app.hdmi1"), "HDMI_1")
     check("appid hdmi4", hdmiFromAppId("com.webos.app.hdmi4"), "HDMI_4")
+    check("appid empty suffix", hdmiFromAppId("com.webos.app.hdmi"), nil)
     check("appid netflix", hdmiFromAppId("netflix"), nil)
     check("appid livetv", hdmiFromAppId("com.webos.app.livetv"), nil)
-    // inverse: HDMI id -> appId (what we hand to lgtv-audio-sync after a switch)
-    check("hdmi->appid 1", appIdFromHDMI("HDMI_1"), "com.webos.app.hdmi1")
-    check("hdmi->appid 4", appIdFromHDMI("HDMI_4"), "com.webos.app.hdmi4")
-    check("hdmi->appid bare", appIdFromHDMI("HDMI_"), nil)
-    check("hdmi->appid nonhdmi", appIdFromHDMI("netflix"), nil)
-    check("hdmi->appid lowerword", appIdFromHDMI("HDMI_X"), nil)
-    check("hdmi->appid roundtrip", appIdFromHDMI(hdmiFromAppId("com.webos.app.hdmi2") ?? "?"), "com.webos.app.hdmi2")
-
     let payload = (try? JSONSerialization.jsonObject(
         with: fixtureJSON.data(using: .utf8)!)) as? [String: Any] ?? [:]
     let inputs = parseInputs(payload)
     check("parse count", String(inputs.count), "6")
+    checkArr("parse missing connected", connectedSortedHDMI(parseInputs(["devices": [["id": "HDMI_5"]]])), [])
     let hdmi = connectedSortedHDMI(inputs)
     checkArr("connected sorted", hdmi, ["HDMI_1", "HDMI_3", "HDMI_4"])
+    checkArr("connected sorted double digit", connectedSortedHDMI([TVInput(id: "HDMI_2", connected: true), TVInput(id: "HDMI_10", connected: true)]), ["HDMI_2", "HDMI_10"])
 
     check("next mid", pickTarget(current: "HDMI_3", connected: hdmi, step: 1), "HDMI_4")
     check("next wrap", pickTarget(current: "HDMI_4", connected: hdmi, step: 1), "HDMI_1")
@@ -288,18 +246,6 @@ func runSelftest() -> Int32 {
     check("single same", pickTarget(current: "HDMI_1", connected: ["HDMI_1"], step: 1), nil)
     check("single from app", pickTarget(current: nil, connected: ["HDMI_1"], step: 1), "HDMI_1")
     check("empty", pickTarget(current: nil, connected: [], step: 1), nil)
-
-    // Wake-on-LAN magic packet (6x 0xFF + MAC x16 = 102 bytes)
-    check("wol len", wolPacket(mac: "e4:75:dc:32:d2:8c").map { String($0.count) }, "102")
-    check("wol nonhex", wolPacket(mac: "zz:75:dc:32:d2:8c").map { _ in "x" }, nil)
-    check("wol short", wolPacket(mac: "e4:75:dc").map { _ in "x" }, nil)
-    check("wol long", wolPacket(mac: "e4:75:dc:32:d2:8c:99").map { _ in "x" }, nil)  // 14 hex -> reject
-    if let p = wolPacket(mac: "E4-75-DC-32-D2-8C") {      // separators + case tolerant
-        let a = [UInt8](p)
-        check("wol sync", "\(Int(a[0]))/\(Int(a[5]))", "255/255")
-        check("wol mac@6", String(Int(a[6])), "228")     // 0xE4, first MAC byte
-        check("wol mac@101", String(Int(a[101])), "140") // 0x8C, last byte of 16th copy
-    } else { check("wol build", nil, "ok") }
 
     print(failures == 0 ? "selftest: all passed" : "selftest: \(failures) FAILURES")
     return failures == 0 ? 0 : 1
@@ -428,7 +374,7 @@ final class SSAPClient: NSObject, URLSessionWebSocketDelegate {
                 return key
             }
             if type == "error" {
-                throw SSAPError("register rejected: \(msg["error"] as? String ?? "unknown") (run 'pair' to re-pair)")
+                throw SSAPError("register rejected: \(msg["error"] as? String ?? "unknown") (delete clientKey from ~/.config/lgtv-hotkeys/config.json and press the hotkey again to re-pair)")
             }
             if type == "response", (p["pairingType"] as? String) == "PROMPT", !prompted {
                 prompted = true
@@ -439,7 +385,7 @@ final class SSAPClient: NSObject, URLSessionWebSocketDelegate {
         throw SSAPError(prompted ? "pairing prompt not accepted in time" : "register timed out")
     }
 
-    func request(_ uri: String, payload: [String: Any] = [:], timeout: TimeInterval = 5) throws -> [String: Any] {
+    func request(_ uri: String, payload: [String: Any] = [:], timeout: TimeInterval = 2) throws -> [String: Any] {
         msgId += 1
         let id = "req_\(msgId)"
         try sendJSON(["type": "request", "id": id, "uri": uri, "payload": payload])
@@ -533,59 +479,6 @@ func discoverTV() -> [String] {
     }
 }
 
-// MARK: - Wake-on-LAN
-
-/// Build a WoL magic packet from a MAC (any separators/case). nil unless exactly 12 hex nibbles.
-func wolPacket(mac: String) -> Data? {
-    let hex = mac.lowercased().filter { "0123456789abcdef".contains($0) }
-    guard hex.count == 12 else { return nil }
-    var mbytes = [UInt8]()
-    var i = hex.startIndex
-    while i < hex.endIndex {
-        let j = hex.index(i, offsetBy: 2)
-        guard let b = UInt8(hex[i..<j], radix: 16) else { return nil }
-        mbytes.append(b)
-        i = j
-    }
-    var pkt = [UInt8](repeating: 0xFF, count: 6)   // 6x 0xFF sync stream
-    for _ in 0..<16 { pkt.append(contentsOf: mbytes) } // + MAC x16
-    return Data(pkt)
-}
-
-private func sendUDP(_ data: Data, host: String, port: UInt16) {
-    let fd = socket(AF_INET, SOCK_DGRAM, 0)
-    guard fd >= 0 else { return }
-    defer { close(fd) }
-    var yes: Int32 = 1
-    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    addr.sin_addr.s_addr = inet_addr(host)
-    _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-        withUnsafePointer(to: &addr) { ap in
-            ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                sendto(fd, raw.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-    }
-}
-
-/// Broadcast the magic packet to the global + subnet-directed broadcast, ports 9 and 7.
-func sendWoL(mac: String) {
-    guard let pkt = wolPacket(mac: mac) else { logLine("wol: invalid mac \(mac)"); return }
-    var targets: [(String, UInt16)] = [("255.255.255.255", 9), ("255.255.255.255", 7)]
-    if let ip = localIPv4() {
-        let p = ip.split(separator: ".")
-        if p.count == 4 {
-            let bcast = "\(p[0]).\(p[1]).\(p[2]).255"
-            targets.append((bcast, 9)); targets.append((bcast, 7))
-        }
-    }
-    for (h, port) in targets { sendUDP(pkt, host: h, port: port) }
-    logLine("wol: magic packet -> \(mac)")
-}
-
 // MARK: - High-level switch
 
 var cachedClient: SSAPClient?
@@ -606,6 +499,7 @@ func ensureClient() throws -> SSAPClient {
         cfg.save()
     }
     let c = SSAPClient()
+    defer { if cachedClient !== c { c.close() } }
     guard c.connect(ip: cfg.ip!) else { throw SSAPError("cannot connect to TV at \(cfg.ip!)") }
     let key = try c.register(clientKey: cfg.clientKey) {
         logLine("TV is showing a pairing prompt - accept it with the LG remote (60s)")
@@ -619,33 +513,6 @@ func ensureClient() throws -> SSAPClient {
     return c
 }
 
-// Best-effort: tell lgtv-audio-sync to reconcile the bar audio for the input we just switched to,
-// so the audio follows the keypress instead of the audio daemon's ~2.5s poll (the poll catches the
-// foreground flapping mid-switch and fires its edge ~8s late, leaving the bar in ARC-limbo/blinking
-// on the way back to the Mac). Optional integration: if the audio tool isn't installed we skip —
-// the two tools stay independent (lgtv-audio-sync never depends on lgtv-hotkeys).
-func lgtvAudioSyncBinary() -> String? {
-    let exeDir = (CommandLine.arguments[0] as NSString).deletingLastPathComponent
-    let candidates = [
-        exeDir.isEmpty ? nil : "\(exeDir)/lgtv-audio-sync", // sibling binary
-        Config.load().audioSyncPath,                         // explicit path from config
-    ].compactMap { $0 }
-    return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-}
-
-func triggerAudioSync(forInput target: String) {
-    guard let appId = appIdFromHDMI(target), let bin = lgtvAudioSyncBinary() else { return }
-    logLine("audio-sync triggered for \(appId)")
-    // Spawn on a background queue and wait THERE (reaps the child, no zombies) so the switch handler
-    // returns immediately — the reconcile takes ~2-4s and must not stall the next keypress.
-    DispatchQueue.global().async {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["sync", appId]
-        do { try p.run(); p.waitUntilExit() } catch { }
-    }
-}
-
 func switchOnce(step: Int) throws -> String {
     let c = try ensureClient()
     let listResp = try c.request("ssap://tv/getExternalInputList")
@@ -657,7 +524,6 @@ func switchOnce(step: Int) throws -> String {
         return "no-op: connected HDMI inputs \(connected), current \(current ?? currentApp ?? "?")"
     }
     _ = try c.request("ssap://tv/switchInput", payload: ["inputId": target])
-    triggerAudioSync(forInput: target)   // bake the audio switch into the switch routine
     return "switched \(current ?? currentApp ?? "?") -> \(target) (of \(connected))"
 }
 
@@ -684,44 +550,6 @@ func performSwitch(step: Int) -> (ok: Bool, msg: String) {
     }
 }
 
-// MARK: - Wake
-
-/// Wake the TV on keypress: send WoL (wakes from standby when "Mobile TV On"/WoWLAN is on),
-/// then if the panel is reachable, turn the screen on over SSAP (covers screen-off-but-powered).
-/// Idempotent: a no-op when the TV is already on.
-func performWake() -> (ok: Bool, msg: String) {
-    var cfg = Config.load()
-    if let mac = cfg.mac { sendWoL(mac: mac) }   // MAC-based, IP-independent — always safe
-    func reachable() -> Bool {
-        guard let ip = cfg.ip else { return false }
-        return probeTCP(ip, 3001) || probeTCP(ip, 3000)
-    }
-    // Give a just-woken NIC a beat; then, if still unreachable, re-discover (DHCP reshuffles).
-    var tries = 0
-    while !reachable() && tries < 6 { usleep(500_000); tries += 1 }
-    if !reachable(), let found = discoverTV().first, found != cfg.ip {
-        logLine("wake: re-pinned TV ip \(cfg.ip ?? "none") -> \(found)")
-        cfg.ip = found
-        cfg.save()
-        teardownClient()
-    }
-    if reachable() {
-        do {
-            let c = try ensureClient()
-            _ = try? c.request("ssap://com.webos.service.tvpower/power/turnOnScreen")
-            return (true, cfg.mac == nil
-                    ? "screen on (add \"mac\" to config for WoL wake-from-standby)"
-                    : "woke TV (WoL + screen-on)")
-        } catch {
-            return (cfg.mac != nil, "WoL sent; screen-on failed: \(error)")
-        }
-    }
-    if let mac = cfg.mac {
-        return (true, "WoL sent to \(mac) (panel still asleep — enable \"Mobile TV On\" on the TV for standby wake)")
-    }
-    return (false, "no mac configured and TV unreachable; nothing to wake")
-}
-
 // MARK: - Hotkeys + daemon
 
 let hkSignature: OSType = 0x4C47_5456 // 'LGTV'
@@ -730,13 +558,6 @@ let pendingLock = NSLock()
 var pendingCount = 0
 
 func handleHotkey(_ id: UInt32) {
-    if id == 3 {                          // ctrl+shift+up = wake TV
-        switchQueue.async {
-            let r = performWake()
-            logLine("hotkey wake: \(r.msg)")
-        }
-        return
-    }
     let step = (id == 2) ? 1 : -1
     pendingLock.lock()
     let backlog = pendingCount
@@ -773,11 +594,7 @@ func registerHotkeys() -> Bool {
     let rcR = RegisterEventHotKey(UInt32(kVK_RightArrow), mods,
                                   EventHotKeyID(signature: hkSignature, id: 2),
                                   GetEventDispatcherTarget(), 0, &refR)
-    var refU: EventHotKeyRef?
-    let rcU = RegisterEventHotKey(UInt32(kVK_UpArrow), mods,
-                                  EventHotKeyID(signature: hkSignature, id: 3),
-                                  GetEventDispatcherTarget(), 0, &refU)
-    return rcL == noErr && rcR == noErr && rcU == noErr
+    return rcL == noErr && rcR == noErr
 }
 
 func runDaemon() -> Never {
@@ -789,90 +606,20 @@ func runDaemon() -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
     guard registerHotkeys() else {
-        logLine("FATAL: could not register ctrl+shift+left/right/up hotkeys (combo taken, or no GUI session)")
+        logLine("FATAL: could not register ctrl+shift+left/right hotkeys (combo taken, or no GUI session)")
         exit(1)
     }
-    logLine("hotkeys: ctrl+shift+left = prev HDMI, ctrl+shift+right = next HDMI, ctrl+shift+up = wake TV")
+    logLine("hotkeys: ctrl+shift+left = prev HDMI, ctrl+shift+right = next HDMI")
+    switchQueue.async {
+        guard cfg.ip != nil, cfg.clientKey != nil else { return }
+        do { _ = try ensureClient() }
+        catch { logLine("warm-up failed: \(error)") }
+    }
     app.run()
     exit(0)
 }
 
 // MARK: - Commands
-
-func cmdDiscover() -> Int32 {
-    let hits = discoverTV()
-    if hits.isEmpty {
-        print("no hosts with webos ports (3000/3001) on the subnet")
-        return 1
-    }
-    for h in hits { print(h) }
-    return 0
-}
-
-func cmdStatus() -> Int32 {
-    let cfg = Config.load()
-    print("config:  \(Config.file.path)")
-    print("tv ip:   \(cfg.ip ?? "unset")")
-    print("paired:  \(cfg.clientKey != nil)")
-    if let ip = cfg.ip {
-        print("reachable: \(probeTCP(ip, 3001) || probeTCP(ip, 3000))")
-    }
-    return 0
-}
-
-func cmdPair() -> Int32 {
-    var cfg = Config.load()
-    if cfg.ip == nil {
-        print("sweeping subnet for the TV...")
-        guard let found = discoverTV().first else {
-            print("no webos TV found; is it on the network?")
-            return 1
-        }
-        cfg.ip = found
-        cfg.save()
-        print("found TV at \(found)")
-    }
-    let c = SSAPClient()
-    guard c.connect(ip: cfg.ip!) else {
-        print("cannot connect to \(cfg.ip!):3001/3000")
-        return 1
-    }
-    defer { c.close() }
-    do {
-        let key = try c.register(clientKey: nil) {
-            print("ACCEPT the prompt on the TV with the LG remote (60s)...")
-        }
-        cfg.clientKey = key
-        cfg.save()
-        print("paired; key stored in \(Config.file.path)")
-        return 0
-    } catch {
-        print("pairing failed: \(error)")
-        return 1
-    }
-}
-
-func cmdList() -> Int32 {
-    do {
-        let c = try ensureClient()
-        defer { teardownClient() }
-        let listResp = try c.request("ssap://tv/getExternalInputList")
-        let inputs = parseInputs(listResp)
-        let fg = try? c.request("ssap://com.webos.applicationManager/getForegroundAppInfo")
-        let currentApp = fg?["appId"] as? String ?? "?"
-        let current = hdmiFromAppId(currentApp)
-        print("current app: \(currentApp)")
-        for i in inputs {
-            let mark = (i.id == current) ? "  <- current" : ""
-            print("  \(i.id.padding(toLength: 8, withPad: " ", startingAt: 0)) \(i.connected ? "connected" : "-        ") \(i.appId)\(mark)")
-        }
-        return 0
-    } catch {
-        print("list failed: \(error)")
-        teardownClient()
-        return 1
-    }
-}
 
 func cmdSwitch(_ step: Int) -> Int32 {
     let r = performSwitch(step: step)
@@ -881,36 +628,19 @@ func cmdSwitch(_ step: Int) -> Int32 {
     return r.ok ? 0 : 1
 }
 
-func cmdWake() -> Int32 {
-    let r = performWake()
-    print(r.msg)
-    teardownClient()
-    return r.ok ? 0 : 1
-}
-
 let usage = """
 lgtv-hotkeys <command>
-  daemon    run the hotkey daemon (ctrl+shift+left/right cycle HDMI inputs, ctrl+shift+up wakes)
+  daemon    run the hotkey daemon (ctrl+shift+left/right cycle HDMI inputs)
   next      switch TV to next connected HDMI input
   prev      switch TV to previous connected HDMI input
-  wake      wake the TV (Wake-on-LAN + screen-on)
-  list      show TV inputs and current app
-  pair      (re)pair with the TV (accept the prompt with the LG remote)
-  discover  sweep the subnet for webos TVs
-  status    show config + reachability
   selftest  run the pure-logic test suite
 """
 
 let cmd = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "help"
 switch cmd {
 case "selftest": exit(runSelftest())
-case "discover": exit(cmdDiscover())
-case "status": exit(cmdStatus())
-case "pair": exit(cmdPair())
-case "list": exit(cmdList())
 case "next": exit(cmdSwitch(1))
 case "prev": exit(cmdSwitch(-1))
-case "wake": exit(cmdWake())
 case "daemon": runDaemon()
 default: print(usage); exit(cmd == "help" ? 0 : 2)
 }
