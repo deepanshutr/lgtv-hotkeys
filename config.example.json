@@ -1,6 +1,3 @@
 {
-  "ip": "TV_IP_OR_EMPTY",
-  "clientKey": "YOUR_SSAP_CLIENT_KEY",
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "audioSyncPath": ""
+  "ip": ""
 }
