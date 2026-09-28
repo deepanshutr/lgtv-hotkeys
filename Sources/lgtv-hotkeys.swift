@@ -385,7 +385,7 @@ final class SSAPClient: NSObject, URLSessionWebSocketDelegate {
         throw SSAPError(prompted ? "pairing prompt not accepted in time" : "register timed out")
     }
 
-    func request(_ uri: String, payload: [String: Any] = [:], timeout: TimeInterval = 2) throws -> [String: Any] {
+    func request(_ uri: String, payload: [String: Any] = [:], timeout: TimeInterval = 5) throws -> [String: Any] {
         msgId += 1
         let id = "req_\(msgId)"
         try sendJSON(["type": "request", "id": id, "uri": uri, "payload": payload])
@@ -490,6 +490,7 @@ func teardownClient() {
 
 func ensureClient() throws -> SSAPClient {
     if let c = cachedClient, c.isOpen { return c }
+    teardownClient()
     var cfg = Config.load()
     if cfg.ip == nil {
         logLine("no TV ip configured; sweeping subnet for webos ports...")
@@ -539,9 +540,11 @@ func performSwitch(step: Int) -> (ok: Bool, msg: String) {
             let hits = discoverTV()
             if let found = hits.first, found != cfg.ip {
                 logLine("re-pinning TV ip \(cfg.ip ?? "none") -> \(found)")
+                let previousIP = cfg.ip
                 cfg.ip = found
                 cfg.save()
                 do { return (true, try switchOnce(step: step)) } catch {
+                    cfg = Config.load(); cfg.ip = previousIP; cfg.save()
                     return (false, "fail after re-discovery: \(error)")
                 }
             }
