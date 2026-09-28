@@ -18,6 +18,7 @@ func logLine(_ msg: String) {
 struct Config {
     var ip: String?
     var clientKey: String?
+    var mac: String?
 
     static var dir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/lgtv-hotkeys")
@@ -30,7 +31,8 @@ struct Config {
             return Config()
         }
         let ip = obj["ip"] as? String
-        return Config(ip: ip == "" ? nil : ip, clientKey: obj["clientKey"] as? String)
+        return Config(ip: ip == "" ? nil : ip, clientKey: obj["clientKey"] as? String,
+                      mac: obj["mac"] as? String)
     }
 
     func save() {
@@ -38,6 +40,7 @@ struct Config {
         var obj: [String: Any] = [:]
         if let ip = ip { obj["ip"] = ip }
         if let k = clientKey { obj["clientKey"] = k }
+        if let m = mac { obj["mac"] = m }
         if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .prettyPrinted]) {
             try? data.write(to: Config.file)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Config.file.path)
@@ -200,6 +203,22 @@ func pickTarget(current: String?, connected: [String], step: Int) -> String? {
     return target == cur ? nil : target
 }
 
+func wolPacket(mac: String) -> Data? {
+    let hex = mac.lowercased().filter { "0123456789abcdef".contains($0) }
+    guard hex.count == 12 else { return nil }
+    var mbytes = [UInt8]()
+    var i = hex.startIndex
+    while i < hex.endIndex {
+        let j = hex.index(i, offsetBy: 2)
+        guard let b = UInt8(hex[i..<j], radix: 16) else { return nil }
+        mbytes.append(b)
+        i = j
+    }
+    var pkt = [UInt8](repeating: 0xFF, count: 6)
+    for _ in 0..<16 { pkt.append(contentsOf: mbytes) }
+    return Data(pkt)
+}
+
 // MARK: - Selftest
 
 let fixtureJSON = #"""
@@ -246,6 +265,17 @@ func runSelftest() -> Int32 {
     check("single same", pickTarget(current: "HDMI_1", connected: ["HDMI_1"], step: 1), nil)
     check("single from app", pickTarget(current: nil, connected: ["HDMI_1"], step: 1), "HDMI_1")
     check("empty", pickTarget(current: nil, connected: [], step: 1), nil)
+
+    check("wol len", wolPacket(mac: "e4:75:dc:32:d2:8c").map { String($0.count) }, "102")
+    check("wol nonhex", wolPacket(mac: "zz:75:dc:32:d2:8c").map { _ in "x" }, nil)
+    check("wol short", wolPacket(mac: "e4:75:dc").map { _ in "x" }, nil)
+    check("wol long", wolPacket(mac: "e4:75:dc:32:d2:8c:99").map { _ in "x" }, nil)
+    if let p = wolPacket(mac: "E4-75-DC-32-D2-8C") {
+        let a = [UInt8](p)
+        check("wol sync", "\(Int(a[0]))/\(Int(a[5]))", "255/255")
+        check("wol mac@6", String(Int(a[6])), "228")
+        check("wol mac@101", String(Int(a[101])), "140")
+    } else { check("wol build", nil, "ok") }
 
     print(failures == 0 ? "selftest: all passed" : "selftest: \(failures) FAILURES")
     return failures == 0 ? 0 : 1
@@ -479,6 +509,38 @@ func discoverTV() -> [String] {
     }
 }
 
+private func sendUDP(_ data: Data, host: String, port: UInt16) {
+    let fd = socket(AF_INET, SOCK_DGRAM, 0)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    var yes: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = port.bigEndian
+    addr.sin_addr.s_addr = inet_addr(host)
+    _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        withUnsafePointer(to: &addr) { ap in
+            ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                sendto(fd, raw.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+}
+
+func powerOn() -> (ok: Bool, msg: String) {
+    let cfg = Config.load()
+    guard let mac = cfg.mac, !mac.isEmpty else { return (false, "mac is missing from config") }
+    guard let packet = wolPacket(mac: mac) else { return (false, "invalid mac in config") }
+    if let ip = localIPv4() {
+        let base = ip.split(separator: ".").dropLast().joined(separator: ".")
+        sendUDP(packet, host: "\(base).255", port: 9)
+    }
+    if let ip = cfg.ip { sendUDP(packet, host: ip, port: 9) }
+    sendUDP(packet, host: "255.255.255.255", port: 9)
+    return (true, "power on: magic packet sent")
+}
+
 // MARK: - High-level switch
 
 var cachedClient: SSAPClient?
@@ -499,6 +561,10 @@ func ensureClient() throws -> SSAPClient {
         cfg.ip = found
         cfg.save()
     }
+    let ip = cfg.ip!
+    guard probeTCP(ip, 3001, timeoutMs: 500) || probeTCP(ip, 3000, timeoutMs: 500) else {
+        throw SSAPError("TV unreachable at \(ip)")
+    }
     let c = SSAPClient()
     defer { if cachedClient !== c { c.close() } }
     guard c.connect(ip: cfg.ip!) else { throw SSAPError("cannot connect to TV at \(cfg.ip!)") }
@@ -514,8 +580,7 @@ func ensureClient() throws -> SSAPClient {
     return c
 }
 
-func switchOnce(step: Int) throws -> String {
-    let c = try ensureClient()
+func switchOnce(_ c: SSAPClient, step: Int) throws -> String {
     let listResp = try c.request("ssap://tv/getExternalInputList")
     let connected = connectedSortedHDMI(parseInputs(listResp))
     let fg = try? c.request("ssap://com.webos.applicationManager/getForegroundAppInfo")
@@ -528,12 +593,18 @@ func switchOnce(step: Int) throws -> String {
     return "switched \(current ?? currentApp ?? "?") -> \(target) (of \(connected))"
 }
 
+func powerOff(_ c: SSAPClient) throws -> String {
+    defer { teardownClient() }
+    _ = try c.request("ssap://system/turnOff")
+    return "powered off"
+}
+
 // One transparent retry with a fresh connection, then one retry after re-discovery
 // (the router reshuffles DHCP leases, so the pinned ip can go stale).
-func performSwitch(step: Int) -> (ok: Bool, msg: String) {
-    do { return (true, try switchOnce(step: step)) } catch {
+func performOperation(_ operation: (SSAPClient) throws -> String) -> (ok: Bool, msg: String) {
+    do { return (true, try operation(ensureClient())) } catch {
         teardownClient()
-        do { return (true, try switchOnce(step: step)) } catch {
+        do { return (true, try operation(ensureClient())) } catch {
             let firstErr = "\(error)"
             teardownClient()
             var cfg = Config.load()
@@ -543,7 +614,7 @@ func performSwitch(step: Int) -> (ok: Bool, msg: String) {
                 let previousIP = cfg.ip
                 cfg.ip = found
                 cfg.save()
-                do { return (true, try switchOnce(step: step)) } catch {
+                do { return (true, try operation(ensureClient())) } catch {
                     cfg = Config.load(); cfg.ip = previousIP; cfg.save()
                     return (false, "fail after re-discovery: \(error)")
                 }
@@ -561,6 +632,17 @@ let pendingLock = NSLock()
 var pendingCount = 0
 
 func handleHotkey(_ id: UInt32) {
+    let arrival = DispatchTime.now().uptimeNanoseconds
+    func completion(_ msg: String) {
+        let ms = (DispatchTime.now().uptimeNanoseconds - arrival) / 1_000_000
+        logLine("\(msg) (\(ms) ms)")
+    }
+    if id == 3 {
+        let r = powerOn()
+        completion("hotkey on: \(r.msg)")
+        if r.ok { switchQueue.async { teardownClient() } }
+        return
+    }
     let step = (id == 2) ? 1 : -1
     pendingLock.lock()
     let backlog = pendingCount
@@ -568,8 +650,11 @@ func handleHotkey(_ id: UInt32) {
     pendingLock.unlock()
     guard backlog < 3 else { return }
     switchQueue.async {
-        let r = performSwitch(step: step)
-        logLine("hotkey step \(step > 0 ? "+1" : "-1"): \(r.msg)")
+        let r = performOperation { c in
+            try id == 4 ? powerOff(c) : switchOnce(c, step: step)
+        }
+        let action = id == 4 ? "off" : "step \(step > 0 ? "+1" : "-1")"
+        completion("hotkey \(action): \(r.msg)")
         pendingLock.lock()
         pendingCount -= 1
         pendingLock.unlock()
@@ -597,7 +682,15 @@ func registerHotkeys() -> Bool {
     let rcR = RegisterEventHotKey(UInt32(kVK_RightArrow), mods,
                                   EventHotKeyID(signature: hkSignature, id: 2),
                                   GetEventDispatcherTarget(), 0, &refR)
-    return rcL == noErr && rcR == noErr
+    var refU: EventHotKeyRef?
+    var refD: EventHotKeyRef?
+    let rcU = RegisterEventHotKey(UInt32(kVK_UpArrow), mods,
+                                  EventHotKeyID(signature: hkSignature, id: 3),
+                                  GetEventDispatcherTarget(), 0, &refU)
+    let rcD = RegisterEventHotKey(UInt32(kVK_DownArrow), mods,
+                                  EventHotKeyID(signature: hkSignature, id: 4),
+                                  GetEventDispatcherTarget(), 0, &refD)
+    return rcL == noErr && rcR == noErr && rcU == noErr && rcD == noErr
 }
 
 func runDaemon() -> Never {
@@ -609,10 +702,10 @@ func runDaemon() -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
     guard registerHotkeys() else {
-        logLine("FATAL: could not register ctrl+shift+left/right hotkeys (combo taken, or no GUI session)")
+        logLine("FATAL: could not register ctrl+shift+left/right/up/down hotkeys (combo taken, or no GUI session)")
         exit(1)
     }
-    logLine("hotkeys: ctrl+shift+left = prev HDMI, ctrl+shift+right = next HDMI")
+    logLine("hotkeys: ctrl+shift+left = prev HDMI, ctrl+shift+right = next HDMI, ctrl+shift+up = power on, ctrl+shift+down = power off")
     switchQueue.async {
         guard cfg.ip != nil, cfg.clientKey != nil else { return }
         do { _ = try ensureClient() }
@@ -625,7 +718,14 @@ func runDaemon() -> Never {
 // MARK: - Commands
 
 func cmdSwitch(_ step: Int) -> Int32 {
-    let r = performSwitch(step: step)
+    let r = performOperation { try switchOnce($0, step: step) }
+    logLine(r.msg)
+    teardownClient()
+    return r.ok ? 0 : 1
+}
+
+func cmdPower(_ on: Bool) -> Int32 {
+    let r = on ? powerOn() : performOperation(powerOff)
     logLine(r.msg)
     teardownClient()
     return r.ok ? 0 : 1
@@ -633,9 +733,11 @@ func cmdSwitch(_ step: Int) -> Int32 {
 
 let usage = """
 lgtv-hotkeys <command>
-  daemon    run the hotkey daemon (ctrl+shift+left/right cycle HDMI inputs)
+  daemon    run the hotkey daemon (ctrl+shift+left/right cycle HDMI, up/down power on/off)
   next      switch TV to next connected HDMI input
   prev      switch TV to previous connected HDMI input
+  on        power TV on with Wake-on-LAN
+  off       power TV off
   selftest  run the pure-logic test suite
 """
 
@@ -644,6 +746,8 @@ switch cmd {
 case "selftest": exit(runSelftest())
 case "next": exit(cmdSwitch(1))
 case "prev": exit(cmdSwitch(-1))
+case "on": exit(cmdPower(true))
+case "off": exit(cmdPower(false))
 case "daemon": runDaemon()
 default: print(usage); exit(cmd == "help" ? 0 : 2)
 }
